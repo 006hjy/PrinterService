@@ -659,6 +659,32 @@ STATIC_FOLDER = get_resource_path('static')
 UPLOAD_FOLDER = os.path.join(os.getcwd(), 'uploads')
 PDF_FOLDER = os.path.join(os.getcwd(), 'pdfs')
 LOG_FILE = os.path.join(os.getcwd(), 'print_log.txt')
+DEFAULT_PRINTER_FILE = os.path.join(os.getcwd(), 'default_printer.json')
+
+import json as _json
+
+def get_default_printer():
+    """读取用户设定的默认打印机名；不存在或已被卸载时返回 None。"""
+    try:
+        with open(DEFAULT_PRINTER_FILE, 'r', encoding='utf-8') as f:
+            name = _json.load(f).get('printer')
+        # 校验该打印机仍然存在于本机列表中
+        if name and name in PRINTERS:
+            return name
+    except Exception:
+        pass
+    return None
+
+def set_default_printer(printer_name):
+    """写入默认打印机；传 None/空串则清空。"""
+    if printer_name:
+        with open(DEFAULT_PRINTER_FILE, 'w', encoding='utf-8') as f:
+            _json.dump({'printer': printer_name}, f, ensure_ascii=False)
+    else:
+        try:
+            os.remove(DEFAULT_PRINTER_FILE)
+        except FileNotFoundError:
+            pass
 
 app = Flask(__name__, template_folder=STATIC_FOLDER, static_folder=STATIC_FOLDER)
 
@@ -946,6 +972,7 @@ def index():
     
     return render_template('index.html', 
                          printers=PRINTERS, 
+                         default_printer=get_default_printer(),
                          files=files, 
                          logs=logs,
                          office_available=OFFICE_AVAILABLE,
@@ -1114,6 +1141,23 @@ def printer_capabilities_api():
     for p in PRINTERS:
         caps[p] = get_printer_capabilities(p)
     return jsonify(caps)
+
+@app.route('/api/default_printer', methods=['GET'])
+def get_default_printer_api():
+    return jsonify({'printer': get_default_printer()})
+
+@app.route('/api/default_printer', methods=['POST'])
+def set_default_printer_api():
+    data = request.get_json(silent=True) or {}
+    printer = data.get('printer')
+    # 不存在或不为空时必须校验在列表内；空串/None 视为取消默认
+    if printer and printer not in PRINTERS:
+        return jsonify({'success': False, 'message': '该打印机不存在于本机列表中'}), 400
+    try:
+        set_default_printer(printer or None)
+        return jsonify({'success': True, 'default_printer': printer or None})
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)}), 500
 
 @app.route('/api/printer_capabilities/<path:printer_name>')
 def printer_capabilities_one_api(printer_name):

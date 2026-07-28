@@ -210,32 +210,24 @@
     <div class="left-panel">
         <div class="left-content">
             <h1 class="text-center">内网打印服务</h1>
-            
-            <div class="silent-print-info">
-                <strong>🔧 静默打印功能:</strong> 使用Windows底层打印API，完全避免弹出任何程序界面
-            </div>
-            
-            <div class="conversion-info">
-				<strong>转换能力状态:</strong><br>
-				<span class="{% if pymupdf_available %}status-good{% else %}status-missing{% endif %}">
-					PDF处理(PyMuPDF): {{ '✓ 可用' if pymupdf_available else '✗ 未安装 - 静默打印功能不可用' }}
-				</span><br>
-				<span class="{% if office_available %}status-good{% else %}status-missing{% endif %}">
-					Office COM组件: {{ '✓ 可用' if office_available else '✗ 未安装Office' }}
-				</span>
-				<br><small>所有转换都是完全静默的，不会弹出任何界面</small>
-			</div>
-            
+
             <div class="print-settings">
-                <h4>打印设置</h4>
                 <div class="row g-3">
                     <div class="col-12">
                         <label class="form-label">选择打印机</label>
                         <select id="printerSelect" class="form-select">
                             {% for p in printers %}
-                                <option value="{{p}}">{{p}}</option>
+                                <option value="{{ p }}"
+                                    {% if p == default_printer %}selected{% endif %}>{{ p }}</option>
                             {% endfor %}
                         </select>
+                        <div class="form-check mt-2 ms-1">
+                            <input class="form-check-input" type="checkbox" id="setDefaultChk"
+                                {% if default_printer %}checked{% endif %}>
+                            <label class="form-check-label" for="setDefaultChk">
+                                设为默认打印机
+                            </label>
+                        </div>
                     </div>
                     <div class="col-6">
                         <label class="form-label">打印份数</label>
@@ -280,6 +272,23 @@
                     <li class="list-group-item">{{l}}</li>
                 {% endfor %}
             </ul>
+
+            <div class="mt-4"></div>
+
+            <div class="silent-print-info">
+                <strong>🔧 静默打印功能:</strong> 使用Windows底层打印API，完全避免弹出任何程序界面
+            </div>
+
+            <div class="conversion-info">
+				<strong>转换能力状态:</strong><br>
+				<span class="{% if pymupdf_available %}status-good{% else %}status-missing{% endif %}">
+					PDF处理(PyMuPDF): {{ '✓ 可用' if pymupdf_available else '✗ 未安装 - 静默打印功能不可用' }}
+				</span><br>
+				<span class="{% if office_available %}status-good{% else %}status-missing{% endif %}">
+					Office COM组件: {{ '✓ 可用' if office_available else '✗ 未安装Office' }}
+				</span>
+				<br><small>所有转换都是完全静默的，不会弹出任何界面</small>
+			</div>
         </div>
     </div>
 
@@ -316,6 +325,10 @@ document.addEventListener('DOMContentLoaded', function() {
     const duplexSelect = document.getElementById('duplexSelect');
     const duplexHint = document.getElementById('duplexHint');
     const paperSizeSelect = document.getElementById('paperSizeInput');
+    const setDefaultChk = document.getElementById('setDefaultChk');
+
+    // 保存当前服务端记录的默认打印机名（可能为 null），用于复选框状态联动
+    let currentDefault = {{ default_printer | tojson }};
 
     // 缓存打印机能力 { printerName: { duplex: bool, paper_sizes: [{id, name}, ...] } }
     let printerCapsCache = {};
@@ -399,6 +412,33 @@ document.addEventListener('DOMContentLoaded', function() {
     printerSelect.addEventListener('change', () => {
         refreshDuplexOptions();
         refreshPaperSizeOptions();
+        // 如果当前选中的项本是默认打印机，勾上复选框；否则按现有默认状态
+        setDefaultChk.checked = (printerSelect.value === currentDefault);
+    });
+
+    // 「设为默认」复选框：勾选则当前选中打印机设为默认；取消勾选则清除默认
+    setDefaultChk.addEventListener('change', () => {
+        const target = setDefaultChk.checked ? printerSelect.value : '';
+        fetch('/api/default_printer', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ printer: target })
+        })
+        .then(r => r.json())
+        .then(res => {
+            if (res.success) {
+                currentDefault = res.default_printer || null;
+                // 如果勾选但服务器返回的默认不是当前选中的，说明被拒绝/出错
+                setDefaultChk.checked = (currentDefault === printerSelect.value);
+            } else {
+                alert(res.message || '设置失败');
+                setDefaultChk.checked = (currentDefault === printerSelect.value);
+            }
+        })
+        .catch(err => {
+            alert('设置失败: ' + err);
+            setDefaultChk.checked = (currentDefault === printerSelect.value);
+        });
     });
     duplexSelect.addEventListener('change', () => {
         const opt = duplexSelect.selectedOptions[0];
