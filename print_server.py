@@ -98,7 +98,7 @@ def create_simple_printer_icon():
     
     return image
 
-def silent_print_pdf(pdf_path, printer_name, copies=1, duplex=1, orientation=None, scale=None):
+def silent_print_pdf(pdf_path, printer_name, copies=1, duplex=1, orientation=None, scale=None, paper_size=None):
     if not PYMUPDF_AVAILABLE:
         raise Exception("PyMuPDF未安装，无法使用静默打印")
     
@@ -123,7 +123,8 @@ def silent_print_pdf(pdf_path, printer_name, copies=1, duplex=1, orientation=Non
             devmode = _build_print_devmode(printer_name,
                                            duplex=int(duplex) if duplex is not None else None,
                                            orientation=orientation,
-                                           scale=None)
+                                           scale=None,
+                                           paper_size=paper_size)
         except Exception as e:
             raise Exception(f"准备 DEVMODE 失败: {e}")
         
@@ -601,22 +602,50 @@ _gdi32.ResetDCW.restype = wintypes.HDC
 
 def get_printer_capabilities(printer_name):
     """
-    查询打印机是否支持双面打印。
-    使用 win32print.DeviceCapabilities(DC_DUPLEX) 检测硬件能力。
-    返回 dict: {'duplex': bool}
+    查询打印机的硬件能力：双面打印、支持的纸张大小。
+    返回 dict:
+      {'duplex': bool,
+       'paper_sizes': [{'id': int(=DMPAPER_*), 'name': str}, ...]}
+    纸张大小通过 DeviceCapabilities 的 DC_PAPERNAMES(16) 和 DC_PAPERS(2) 一起查
+    ——前者返回名字列表，后者按相同的顺序返回 DMPAPER_* id 列表，对齐后拼接成
+    [{id, name}] 形式供前端下拉选择。
     """
-    caps = {'duplex': False}
+    caps = {'duplex': False, 'paper_sizes': []}
+    if not printer_name:
+        return caps
     try:
-        if not printer_name:
-            return caps
         # DC_DUPLEX = 7，返回 1 表示支持双面，0 表示不支持
         # 注意 pywin32 第二参数 port 必须是字符串，None 会报 TypeError
         result = win32print.DeviceCapabilities(printer_name, '', 7)
         caps['duplex'] = (result == 1)
     except Exception as e:
-        # 查询失败按不支持处理，避免让用户误以为可选双面后被忽略
-        print(f"查询打印机能力失败 [{printer_name}]: {e}")
+        # 双面能力查询失败按不支持处理，避免让用户误以为可选双面后被忽略
+        print(f"查询打印机双面能力失败 [{printer_name}]: {e}")
         caps['duplex'] = False
+    try:
+        # DC_PAPERNAMES(16) 返回 ['A4','Letter',...]
+        # DC_PAPERS(2) 返回 [9,1,...] —— 对齐的 DMPAPER_* id 列表
+        names = win32print.DeviceCapabilities(printer_name, '', 16) or []
+        ids = win32print.DeviceCapabilities(printer_name, '', 2) or []
+        paper_sizes = []
+        n = min(len(names), len(ids))
+        for i in range(n):
+            nm = (names[i] or '').strip()
+            if not nm:
+                # 某些条目名字为空时跳过，避免给用户看到空白选项
+                continue
+            try:
+                pid = int(ids[i])
+            except (TypeError, ValueError):
+                continue
+            # 0/负值是非标纸张 id（用户自定义/换算尺寸），不放进下拉
+            if pid > 0 and not any(p['id'] == pid for p in paper_sizes):
+                paper_sizes.append({'id': pid, 'name': nm})
+        caps['paper_sizes'] = paper_sizes
+    except Exception as e:
+        # 纸张能力查询失败不阻塞核心打印流程，前端会显示「无法读取纸张列表」提示
+        print(f"查询打印机纸张能力失败 [{printer_name}]: {e}")
+        caps['paper_sizes'] = []
     return caps
 
 def _build_duplex_devmode(printer_name, duplex):
@@ -628,13 +657,14 @@ def _build_duplex_devmode(printer_name, duplex):
     """
     return _build_print_devmode(printer_name, duplex=duplex)
 
-def _build_print_devmode(printer_name, duplex=None, orientation=None, scale=None):
+def _build_print_devmode(printer_name, duplex=None, orientation=None, scale=None, paper_size=None):
     """
     统一的 DEVMODE 构造器，支持同时下发多项打印设置。
     参数（None 表示不改默认值）：
         duplex:       1=单面, 2=长边翻转(DMDUP_VERTICAL), 3=短边翻转(DMDUP_HORIZONTAL)
         orientation:  'portrait'|1=纵向, 'landscape'|2=横向
         scale:        int 10~200 表示缩放百分比（例如 100=原尺寸, 50=缩小一半）
+        paper_size:   int DMPAPER_* id（如 9=A4, 1=Letter），来自 DeviceCapabilities(DC_PAPERS)
     返回带 driver-extra 内存的 ctypes DEVMODE_FULL 对象；如无任何修改返回 None。
     """
     duplex = int(duplex) if duplex is not None else None
@@ -665,11 +695,21 @@ def _build_print_devmode(printer_name, duplex=None, orientation=None, scale=None
         if not (10 <= scale_int <= 200):
             raise Exception(f"scale 超出范围 [10, 200]: {scale_int}")
 
+    paper_int = None
+    if paper_size is not None:
+        try:
+            paper_int = int(paper_size)
+        except (TypeError, ValueError):
+            raise Exception(f"无效的 paper_size 值: {paper_size}")
+        if paper_int <= 0:
+            # 0/负值视为「使用打印机默认纸张」
+            paper_int = None
+
     # 没有任何修改时直接返回 None（用打印机默认设置）
-    if duplex is None and orientation_norm is None and scale_int is None:
+    if duplex is None and orientation_norm is None and scale_int is None and paper_int is None:
         return None
     # 仅修改单面=默认值视为无修改
-    if duplex == 1 and orientation_norm is None and scale_int is None:
+    if duplex == 1 and orientation_norm is None and scale_int is None and paper_int is None:
         return None
 
     duplex_mapping = {
@@ -707,6 +747,11 @@ def _build_print_devmode(printer_name, duplex=None, orientation=None, scale=None
             # dmScale 是百分比：100=原大小，50=一半，200=两倍
             dm.dmScale = scale_int
             dm.dmFields |= win32con.DM_SCALE
+        if paper_int is not None:
+            # DM_PAPERSIZE = 2：告诉驱动 dmPaperSize 字段有效，进纸/纸张尺寸
+            # 都按 DMPAPER_* id 处理（不要与 dmPaperWidth/Length 同时使用）
+            dm.dmPaperSize = paper_int
+            dm.dmFields |= win32con.DM_PAPERSIZE
         return dm
     finally:
         if hprinter is not None:
@@ -828,7 +873,14 @@ def print_single():
     printer = data.get('printer')
     copies = data.get('copies', 1)
     duplex = data.get('duplex', 1)
-    paper_size = data.get('paper_size', 'A4')
+    paper_size_raw = data.get('paper_size')
+    try:
+        paper_size = int(paper_size_raw) if paper_size_raw else None
+    except (TypeError, ValueError):
+        # 老前端可能仍发字符串 'A4'，无法识别为 DMPAPER id 时整体当作不改纸张
+        print(f"忽略无法解析的 paper_size: {paper_size_raw}")
+        paper_size = None
+    paper_size_log = paper_size if paper_size else '默认'
     quality = data.get('quality', 'normal')
     
     # 前端拦截失败后的后端兑底校验：打印机不支持双面时禁止使用
@@ -836,7 +888,7 @@ def print_single():
         caps = get_printer_capabilities(printer)
         if not caps.get('duplex', False):
             msg = f"打印机 [{printer}] 不支持双面打印，请选择单面"
-            log_print(filename, printer, copies, duplex, paper_size, quality, msg)
+            log_print(filename, printer, copies, duplex, paper_size_log, quality, msg)
             return jsonify({'success': False, 'message': msg})
     
     try:
@@ -848,8 +900,8 @@ def print_single():
             return jsonify({'success': False, 'message': '文件未转换为PDF，无法静默打印'})
         
         try:
-            silent_print_pdf(pdf_path, printer, copies, duplex)
-            log_print(filename, printer, copies, duplex, paper_size, quality, "静默打印成功")
+            silent_print_pdf(pdf_path, printer, copies, duplex, paper_size=paper_size)
+            log_print(filename, printer, copies, duplex, paper_size_log, quality, "静默打印成功")
             return jsonify({'success': True, 'message': '静默打印成功'})
         except Exception as e:
             if PYMUPDF_AVAILABLE:
@@ -871,7 +923,13 @@ def print_all():
     printer = data.get('printer')
     copies = data.get('copies', 1)
     duplex = data.get('duplex', 1)
-    paper_size = data.get('paper_size', 'A4')
+    paper_size_raw = data.get('paper_size')
+    try:
+        paper_size = int(paper_size_raw) if paper_size_raw else None
+    except (TypeError, ValueError):
+        print(f"忽略无法解析的 paper_size: {paper_size_raw}")
+        paper_size = None
+    paper_size_log = paper_size if paper_size else '默认'
     quality = data.get('quality', 'normal')
     orientation = data.get('orientation')
     scale = data.get('scale')
@@ -894,11 +952,11 @@ def print_all():
         for file_info in files:
             if file_info['pdf_path'] and os.path.exists(file_info['pdf_path']):
                 try:
-                    silent_print_pdf(file_info['pdf_path'], printer, copies, duplex, orientation=orientation, scale=scale)
-                    log_print(file_info['name'], printer, copies, duplex, paper_size, quality, "静默批量打印成功", orientation, scale)
+                    silent_print_pdf(file_info['pdf_path'], printer, copies, duplex, orientation=orientation, scale=scale, paper_size=paper_size)
+                    log_print(file_info['name'], printer, copies, duplex, paper_size_log, quality, "静默批量打印成功", orientation, scale)
                     printed_count += 1
                 except Exception as e:
-                    log_print(file_info['name'], printer, copies, duplex, paper_size, quality, f"静默批量打印失败: {str(e)}", orientation, scale)
+                    log_print(file_info['name'], printer, copies, duplex, paper_size_log, quality, f"静默批量打印失败: {str(e)}", orientation, scale)
                     failed_count += 1
         
         if printed_count > 0:

@@ -243,7 +243,9 @@
                     </div>
                     <div class="col-6">
                         <label class="form-label">纸张大小</label>
-                        <input type="text" id="paperSizeInput" value="A4" class="form-control">
+                        <select id="paperSizeInput" class="form-select">
+                            <option value="">加载中...</option>
+                        </select>
                     </div>
                     <div class="col-12">
                         <label class="form-label">单双面</label>
@@ -313,9 +315,45 @@ document.addEventListener('DOMContentLoaded', function() {
     const printerSelect = document.getElementById('printerSelect');
     const duplexSelect = document.getElementById('duplexSelect');
     const duplexHint = document.getElementById('duplexHint');
+    const paperSizeSelect = document.getElementById('paperSizeInput');
 
-    // 缓存打印机能力 { printerName: { duplex: bool } }
+    // 缓存打印机能力 { printerName: { duplex: bool, paper_sizes: [{id, name}, ...] } }
     let printerCapsCache = {};
+
+    // 根据当前选中打印机刷新纸张下拉
+    // 切换打印机后纸张列表会变，所以每次 change 都要重建 option
+    function refreshPaperSizeOptions() {
+        const printer = printerSelect.value;
+        const caps = printerCapsCache[printer] || {};
+        const paperSizes = Array.isArray(caps.paper_sizes) ? caps.paper_sizes : [];
+        // 清掉旧选项，保留占位元素
+        paperSizeSelect.innerHTML = '';
+        // 默认选项：不指定纸张→让打印机用自己的默认纸张
+        const defaultOpt = document.createElement('option');
+        defaultOpt.value = '';
+        defaultOpt.textContent = '默认';
+        paperSizeSelect.appendChild(defaultOpt);
+        if (paperSizes.length === 0) {
+            // 拿不到列表时给出明确提示选项（value 为空，后端会跳过纸张设置）
+            const warn = document.createElement('option');
+            warn.value = '';
+            warn.textContent = '(无法读取纸张列表)';
+            warn.disabled = true;
+            paperSizeSelect.appendChild(warn);
+        } else {
+            paperSizes.forEach(p => {
+                const opt = document.createElement('option');
+                // value 是 DMPAPER_* id，后端直接拿去填 dmPaperSize
+                opt.value = String(p.id);
+                opt.textContent = p.name;
+                // 默认选中 A4（DMPAPER_A4=9）如果存在
+                if (p.id === 9) {
+                    opt.selected = true;
+                }
+                paperSizeSelect.appendChild(opt);
+            });
+        }
+    }
 
     // 根据当前选中打印机刷新双面选项可用性
     function refreshDuplexOptions() {
@@ -349,14 +387,19 @@ document.addEventListener('DOMContentLoaded', function() {
             .then(caps => {
                 printerCapsCache = caps || {};
                 refreshDuplexOptions();
+                refreshPaperSizeOptions();
             })
             .catch(err => {
                 console.warn('获取打印机能力失败:', err);
                 refreshDuplexOptions();
+                refreshPaperSizeOptions();
             });
     }
 
-    printerSelect.addEventListener('change', refreshDuplexOptions);
+    printerSelect.addEventListener('change', () => {
+        refreshDuplexOptions();
+        refreshPaperSizeOptions();
+    });
     duplexSelect.addEventListener('change', () => {
         const opt = duplexSelect.selectedOptions[0];
         if (opt && opt.disabled) {
