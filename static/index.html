@@ -449,13 +449,69 @@ document.addEventListener('DOMContentLoaded', function() {
         })
         .then(response => response.json())
         .then(data => {
-            updateFileItem(fileItem, data);
-            refreshFileList();
+            if (!data.success) {
+                updateFileItemStatus(fileItem, data.message || '上传失败', 'danger');
+                return;
+            }
+            // 后端返回的 filename 是去重后的 stored_name（可能比用户原始名多 _1 后缀）
+            // 后续轮询/打印/删除都必须用 stored_name 才能匹配磁盘文件
+            const storedName = data.filename;
+            if (data.queued) {
+                // 进入异步队列：立刻显示「排队中...」，然后启动专属轮询直到看到 PDF
+                updateFileItemStatus(fileItem, '排队中...', 'info');
+                pollConversionStatus(fileItem, storedName, file.name);
+            } else {
+                // 同步转换完成（PDF/图片/文本）：直接走通用刷新拿到完整按钮组
+                refreshFileList();
+            }
         })
         .catch(error => {
             console.error('上传失败:', error);
             updateFileItemStatus(fileItem, '上传失败', 'danger');
         });
+    }
+
+    // 针对单个 Office 文件的转换状态轮询。每 1.5 秒拉一次 /api/files，
+    // 找到目标文件的当前状态：排队中 / 转换中 / 已转换 / 转换失败。
+    // 终止条件：状态进入 done（pdf 存在）/ failed / 超过 60 次仍无果（约 90 秒）
+    function pollConversionStatus(fileItem, storedName, displayName) {
+        let attempts = 0;
+        const maxAttempts = 60;
+        // 用属性记录 timer，允许中途 cancel（例如 window unload，这里暂不实现）
+        const timer = setInterval(() => {
+            attempts++;
+            fetch('/api/files')
+                .then(r => r.json())
+                .then(files => {
+                    // 找到我们的文件
+                    const target = files.find(f => f.name === storedName);
+                    if (!target) {
+                        // 文件被删了或消失了，停止轮询
+                        clearInterval(timer);
+                        return;
+                    }
+                    if (target.pdf_path) {
+                        // PDF 已生成，转换完成 → 直接刷新一次让按钮组生效
+                        clearInterval(timer);
+                        refreshFileList();
+                    } else if (target.status === '转换中...') {
+                        updateFileItemStatus(fileItem, '转换中...', 'warning');
+                    } else if (target.status === '转换失败') {
+                        clearInterval(timer);
+                        updateFileItemStatus(fileItem, '转换失败', 'danger');
+                    } else {
+                        // 仍排队中，保持原样
+                        updateFileItemStatus(fileItem, '排队中...', 'info');
+                    }
+                })
+                .catch(err => {
+                    console.warn('轮询转换状态失败:', err);
+                });
+            if (attempts >= maxAttempts) {
+                clearInterval(timer);
+                updateFileItemStatus(fileItem, '转换超时', 'danger');
+            }
+        }, 1500);
     }
     
     function createFileItem(filename, status, statusColor) {
@@ -482,13 +538,24 @@ document.addEventListener('DOMContentLoaded', function() {
         const actionsElement = fileItem.querySelector('.file-actions');
         
         if (data.success) {
-            statusElement.textContent = data.converted ? '已转换为PDF' : '已上传';
-            statusElement.className = `badge bg-${data.converted ? 'success' : 'secondary'}`;
+            // 优先使用后端给的具体状态（包含「排队中...」「转换中...」「转换失败」），
+            // 仅当后端没给状态时才用「已转换为PDF / 已上传」二选一回落，
+            // 这样可以避免把 createFileItem 刚设置的「排队中」改成「已上传」。
+            if (data.status && data.status_color) {
+                statusElement.textContent = data.status;
+                statusElement.className = `badge bg-${data.status_color}`;
+            } else {
+                statusElement.textContent = data.converted ? '已转换为PDF' : '已上传';
+                statusElement.className = `badge bg-${data.converted ? 'success' : 'secondary'}`;
+            }
             
             let buttonsHtml = '';
             if (data.converted && data.pdf_name) {
                 buttonsHtml += `<button class="btn btn-primary btn-sm" onclick="printFile('${data.filename}')">🔇 静默打印</button>`;
                 buttonsHtml += `<a href="/preview/${data.pdf_name}" target="_blank" class="btn btn-outline-secondary btn-sm">预览PDF</a>`;
+            } else if (data.status && data.status !== '转换失败') {
+                // 排队中 / 转换中：不显示「无法静默打印」，避免误导；只保留预览+删除按钮
+                buttonsHtml += `<span class="text-muted small">${data.status}</span>`;
             } else {
                 buttonsHtml += `<span class="text-muted small">无法静默打印，请先转换为PDF</span>`;
             }
@@ -518,9 +585,18 @@ document.addEventListener('DOMContentLoaded', function() {
                     success: true,
                     filename: file.name,
                     converted: file.pdf_path ? true : false,
-                    pdf_name: file.pdf_name
+                    pdf_name: file.pdf_name,
+                    // 把后端的排队/转换中状态透传给 updateFileItem，
+                    // 否则会被它默认回落成「已上传」覆盖掉
+                    status: file.status,
+                    status_color: file.status_color
                 });
                 fileList.appendChild(fileItem);
+                // 如果该文件正处于异步转换中（没 PDF 但有排队/转换中状态），
+                // 启动专属轮询持续刷新——这样刷新页面后仍能正确推进到「已转换为PDF」
+                if (!file.pdf_path && file.status && (file.status === '排队中...' || file.status === '转换中...')) {
+                    pollConversionStatus(fileItem, file.name, file.name);
+                }
             });
         });
     }

@@ -504,42 +504,149 @@ def sanitize_filename(filename):
     filename = filename.strip('. ')
     return filename
 
+# Office COM（Word/Excel/PowerPoint）是单例且非线程安全：
+# - 同一进程内并发 CreateObject 会拿到同一个 Office 实例
+# - 一个线程调 Word.Quit() 会扛断另一个线程正在处理的文档
+# - Word 必时返回 0x800AC472 (Call was rejected by callee)
+# 因此用一把进程内全局锁串行化所有 Office 转换。
+# 图片/文本/PDF 复制走的是 PIL/reportlab/shutil，都是线程安全的，不需要这把锁。
+_office_convert_lock = threading.Lock()
+
+# --- Office 异步转换队列 ---
+# 同步上传完成、把快任务（PDF/图片/文本）直接做完，docx/xlsx/pptx 入队由后台 worker
+# 串行执行，HTTP /upload 立即返回让前端看到“排队中”状态。
+# 状态字典 key = 上传存储文件名（如 '报告_1.docx'），value: 'queued' | 'converting' | 'done' | 'failed'
+_conversion_status = {}
+_conversion_status_lock = threading.Lock()
+_office_convert_queue = __import__('queue').Queue()
+
+def _set_conversion_status(key, status):
+    """线程安全地更新转换状态字典。"""
+    with _conversion_status_lock:
+        _conversion_status[key] = status
+
+def _get_conversion_status(key):
+    """线程安全地读取转换状态；不存在表示已落盘完成或从未入队（同一回事）。"""
+    with _conversion_status_lock:
+        return _conversion_status.get(key)
+
+def _conversion_worker():
+    """
+    后台单线程 daemon：从队列里取 Office 转换任务，串行执行。
+    这样所有 Word/Excel/PPT 调用都跑在同一线程上，从根本上避免 COM 串扰，
+    也天然取代了显式 _office_convert_lock。
+    """
+    import queue as _queue
+    while True:
+        try:
+            task = _office_convert_queue.get(timeout=3600)
+        except _queue.Empty:
+            continue
+        src_path, pdf_path, stored_name = task
+        _set_conversion_status(stored_name, 'converting')
+        try:
+            ok = False
+            try:
+                ok = convert_office_to_pdf_com_silent(src_path, pdf_path)
+            except Exception as e:
+                print(f"Office转换异常 [{stored_name}]: {e}")
+            if ok and os.path.exists(pdf_path) and os.path.getsize(pdf_path) > 0:
+                _set_conversion_status(stored_name, 'done')
+            else:
+                # 失败时仍在 uploads 区留源文件给清理线程兜底，状态标 failed 让前端红色提示
+                _set_conversion_status(stored_name, 'failed')
+                print(f"Office文件转换失败: {stored_name}")
+        finally:
+            _office_convert_queue.task_done()
+
+def unique_path(target_dir, base_name, ext):
+    """
+    在 target_dir 下生一个不冲突的路径，并**原子地占位创建**。
+    并发上传同名文件时：通过 os.open(O_CREAT|O_EXCL) 保证只有一方拿到该路径，
+    另一方继续尝试下一个名字（_1/_2/…），从而彻底消除 TOCTOU 窗口。
+    返回的路径此时已存在（长度 0 的占位文件），调用方随后用 file.save() 覆写。
+    """
+    clean = sanitize_filename(base_name)
+    ext = ext.lstrip('.')
+    os.makedirs(target_dir, exist_ok=True)
+    # 第一轮：用纯名字 + _N 后缀，保持文件名可读
+    candidates = [f"{clean}.{ext}"]
+    candidates += [f"{clean}_{i}.{ext}" for i in range(1, 10000)]
+    for candidate in candidates:
+        path = os.path.join(target_dir, candidate)
+        try:
+            # O_CREAT|O_EXCL 在 Windows 上也是原子的：只有第一个调用成功
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.close(fd)
+            return path
+        except FileExistsError:
+            continue
+        except OSError:
+            # 权限/盘符问题等：退回 UUID-based 名再试一轮
+            break
+    # 兜底：用一段随机 hex 避免极端情况下卡满 10000 次
+    import uuid
+    for _ in range(8):
+        candidate = f"{clean}_{uuid.uuid4().hex[:8]}.{ext}"
+        path = os.path.join(target_dir, candidate)
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.close(fd)
+            return path
+        except FileExistsError:
+            continue
+    raise RuntimeError(f"无法为目标分配唯一文件名: {clean}.{ext}")
+
 def convert_to_pdf(file_path, output_dir):
+    """
+    把上传文件转换成 PDF。
+    返回 (pdf_path_or_None, queued_bool)：
+      - pdf_path 不为 None：同步转换已完成（PDF/图片/文本）
+      - queued=True：Office 任务已入队异步执行，前端应继续轮询状态
+    Office 入队时，pdf_path 返回的是 worker 会写入的目标路径，本函数不阻塞等待。
+    """
     filename = os.path.basename(file_path)
     name, ext = os.path.splitext(filename)
     ext = ext.lower()
     
+    # 源文件名（original_filepath）已经经过 unique_path 保证唯一，
+    # PDF 名直接沿用 源名前缀.pdf —— 与 uploads 区 1:1 对齐，
+    # 这样 get_file_info 按上传文件名推出的 pdf 名一定能匹配到。
     clean_name = sanitize_filename(name)
-    pdf_filename = f"{clean_name}.pdf"
-    pdf_path = os.path.join(output_dir, pdf_filename)
+    pdf_path = os.path.join(output_dir, f"{clean_name}.pdf")
     
     if ext == '.pdf':
         import shutil
         try:
             shutil.copy2(file_path, pdf_path)
-            return pdf_path
+            return pdf_path, False
         except Exception as e:
             print(f"复制PDF文件失败: {e}")
-            return file_path
+            return file_path, False
     
     if ext in ['.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff']:
         if convert_image_to_pdf(file_path, pdf_path):
-            return pdf_path
+            return pdf_path, False
+        return None, False
     
-    elif ext in ['.txt', '.log', '.md']:
+    if ext in ['.txt', '.log', '.md']:
         if convert_text_to_pdf(file_path, pdf_path):
-            return pdf_path
+            return pdf_path, False
+        return None, False
     
-    elif ext in ['.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx']:
+    if ext in ['.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx']:
         if OFFICE_AVAILABLE:
-            if convert_office_to_pdf_com_silent(file_path, pdf_path):
-                return pdf_path
-            else:
-                print(f"Office文件转换失败: {filename}")
+            # 入队：worker 串行执行所有 Word/Excel/PPT，避免 COM 单例串扰。
+            # 用 stored_name (源文件 basename) 作状态字典 key，与 get_file_info 对齐。
+            _set_conversion_status(filename, 'queued')
+            _office_convert_queue.put((file_path, pdf_path, filename))
+            # 返回目标 pdf_path（虽然此时还没生成）+ queued=True，前端据此启动轮询
+            return pdf_path, True
         else:
             print("Office COM组件不可用")
+            return None, False
     
-    return None
+    return None, False
     
 def get_resource_path(relative_path):
     try:
@@ -815,6 +922,18 @@ def get_file_info():
         else:
             file_info['pdf_path'] = None
             file_info['pdf_name'] = None
+            # Office 异步转换中：根据状态字典显示「排队中」/「转换中」/「转换失败」
+            # _get_conversion_status 返回 None 表示该文件不是 Office 任务（或已完成被清理）
+            status = _get_conversion_status(f)
+            if status == 'queued':
+                file_info['status'] = '排队中...'
+                file_info['status_color'] = 'info'
+            elif status == 'converting':
+                file_info['status'] = '转换中...'
+                file_info['status_color'] = 'warning'
+            elif status == 'failed':
+                file_info['status'] = '转换失败'
+                file_info['status_color'] = 'danger'
             
         files.append(file_info)
     
@@ -845,21 +964,35 @@ def upload_file():
         return jsonify({'success': False, 'message': '文件类型不支持'})
     
     try:
-        original_filepath = os.path.join(UPLOAD_FOLDER, file.filename)
+        # 多用户同名文件防冲突：上传存储名也走 unique_path。
+        # 拆出文件名/扩展名 → 生成 '报告.docx' 或 '报告_1.docx' 这样的唯一名。
+        _bn = os.path.basename(file.filename)
+        _nm, _ex = os.path.splitext(_bn)
+        original_filepath = unique_path(UPLOAD_FOLDER, _nm, _ex)
         file.save(original_filepath)
         
-        pdf_path = convert_to_pdf(original_filepath, PDF_FOLDER)
+        # 返回 (pdf_path, queued)；同步任务直接出结果，Office 任务入队异步处理
+        pdf_path, queued = convert_to_pdf(original_filepath, PDF_FOLDER)
         
+        # 返回给前端的 filename 用 stored_name（含序号），让前端后续轮询能匹配到
+        stored_name = os.path.basename(original_filepath)
         result = {
             'success': True,
-            'filename': file.filename,
-            'converted': pdf_path is not None,
-            'message': '上传成功'
+            # 注意：前端展示用 file.filename 还是 stored_name 取决于 UI 风格；
+            # 这里返回 stored_name 让后续 refresh / print / delete 能精确定位文件。
+            'filename': stored_name,
+            'display_name': file.filename,
+            'converted': bool(pdf_path) and not queued,
+            'queued': queued,
+            'message': '上传成功' if not queued else '上传成功，等待转换'
         }
         
-        if pdf_path:
+        if pdf_path and not queued:
             result['pdf_name'] = os.path.basename(pdf_path)
             result['message'] = '上传并转换成功'
+        elif queued:
+            # 给前端一个明确的状态字符串，方便 uploadFile 直接渲染
+            result['status'] = 'queued'
         
         return jsonify(result)
         
@@ -1035,6 +1168,10 @@ def delete_file():
             os.remove(original_path)
             deleted_files.append('源文件')
         
+        # 清掉遗留的转换状态（避免下次同名上传读到过期的 queued/failed）
+        with _conversion_status_lock:
+            _conversion_status.pop(filename, None)
+        
         name, ext = os.path.splitext(filename)
         pdf_filename = f"{name}.pdf"
         pdf_path = os.path.join(PDF_FOLDER, pdf_filename)
@@ -1100,6 +1237,10 @@ if __name__ == '__main__':
     
     pdf_cleaner_thread = threading.Thread(target=lambda: clean_old_files(PDF_FOLDER), daemon=True)
     pdf_cleaner_thread.start()
+    
+    # Office 转换 worker：永远单线程串行处理所有 docx/xlsx/pptx 任务
+    office_worker_thread = threading.Thread(target=_conversion_worker, daemon=True)
+    office_worker_thread.start()
     
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
