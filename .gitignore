@@ -19,6 +19,8 @@ uploads/*
 # Build outputs (the released exe IS committed on purpose; ignore everything else)
 dist/*
 !dist/*.exe
+build/
+*.spec.bak
 
 # OS / editor
 Thumbs.db

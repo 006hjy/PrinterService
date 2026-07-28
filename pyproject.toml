@@ -10,4 +10,5 @@ dependencies = [
     "reportlab",
     "pymupdf",
     "comtypes",
+    "pyinstaller>=6.21.0",
 ]
