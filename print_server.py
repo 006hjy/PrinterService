@@ -8,6 +8,8 @@ import subprocess
 from datetime import datetime
 import threading
 import sys
+import ctypes
+from ctypes import wintypes
 import pystray
 from PIL import Image, ImageDraw, ImageWin
 import socket
@@ -96,14 +98,35 @@ def create_simple_printer_icon():
     
     return image
 
-def silent_print_pdf(pdf_path, printer_name, copies=1, duplex=1):
+def silent_print_pdf(pdf_path, printer_name, copies=1, duplex=1, orientation=None, scale=None):
     if not PYMUPDF_AVAILABLE:
         raise Exception("PyMuPDF未安装，无法使用静默打印")
     
     if not os.path.exists(pdf_path):
         raise Exception(f"PDF文件不存在: {pdf_path}")
     
+    # 用户缩放参数：转成百分比小数，None / 100 都视为 1.0（保持原 fit 尺寸）
+    # 注意：不走 DEVMODE 的 dmScale（驱动行为不一致，对位图绘制经常被忽略），
+    # 而是直接作用到 GDI 绘制的目标 rect 上 —— 这样 50% 就是真缩小一半。
     try:
+        scale_pct = float(scale) if scale is not None else 100.0
+    except (TypeError, ValueError):
+        raise Exception(f"无效的 scale 值: {scale}")
+    if not (10 <= scale_pct <= 200):
+        raise Exception(f"scale 超出范围 [10, 200]: {scale_pct}")
+    user_scale = scale_pct / 100.0
+    
+    try:
+        # DEVMODE 只用来下发 duplex / orientation（dmScale 走应用层）
+        devmode = None
+        try:
+            devmode = _build_print_devmode(printer_name,
+                                           duplex=int(duplex) if duplex is not None else None,
+                                           orientation=orientation,
+                                           scale=None)
+        except Exception as e:
+            raise Exception(f"准备 DEVMODE 失败: {e}")
+        
         pdf_doc = fitz.open(pdf_path)
         hprinter = win32print.OpenPrinter(printer_name)
         
@@ -111,6 +134,13 @@ def silent_print_pdf(pdf_path, printer_name, copies=1, duplex=1):
             printer_info = win32print.GetPrinter(hprinter, 2)
             hdc = win32ui.CreateDC()
             hdc.CreatePrinterDC(printer_name)
+            
+            # 用修改后的 DEVMODE 重置 DC（仅 duplex + orientation 走这里）
+            if devmode is not None:
+                try:
+                    apply_devmode_to_dc(hdc, devmode)
+                except Exception as e:
+                    print(f"警告: 应用 DEVMODE 失败，将使用打印机默认设置: {e}")
             
             printable_area = hdc.GetDeviceCaps(win32con.HORZRES), hdc.GetDeviceCaps(win32con.VERTRES)
             printer_size = hdc.GetDeviceCaps(win32con.PHYSICALWIDTH), hdc.GetDeviceCaps(win32con.PHYSICALHEIGHT)
@@ -130,16 +160,22 @@ def silent_print_pdf(pdf_path, printer_name, copies=1, duplex=1):
                     img = PILImage.open(io.BytesIO(img_data))
                     
                     img_width, img_height = img.size
-                    scale_x = printable_area[0] / img_width
-                    scale_y = printable_area[1] / img_height
-                    scale = min(scale_x, scale_y) * 0.9
+                    # fit-to-page 基础比例（占满可打印区域，不加 0.9 富余）
+                    fit_scale_x = printable_area[0] / img_width
+                    fit_scale_y = printable_area[1] / img_height
+                    fit_scale = min(fit_scale_x, fit_scale_y)
+                    # 应用用户缩放：100% 时为 fit 尺寸，50% 缩小一半，200% 放大两倍
+                    final_scale = fit_scale * user_scale
                     
-                    scaled_width = int(img_width * scale)
-                    scaled_height = int(img_height * scale)
-                    x = (printable_area[0] - scaled_width) // 2 + printer_margins[0]
-                    y = (printable_area[1] - scaled_height) // 2 + printer_margins[1]
+                    scaled_width = int(img_width * final_scale)
+                    scaled_height = int(img_height * final_scale)
+                    # 注意：win32ui 的 PyDC 默认坐标原点 (0,0) 已经是"可打印区域的左上角"
+                    # PHYSICALOFFSETX/Y 这层物理边距 driver 已在坐标变换里处理过，
+                    # 这里再加 printer_margins 会把内容整体推到右下，导致右下溢出被裁切。
+                    x = (printable_area[0] - scaled_width) // 2
+                    y = (printable_area[1] - scaled_height) // 2
                     
-                    if scale != 1.0:
+                    if final_scale != 1.0:
                         img = img.resize((scaled_width, scaled_height), PILImage.Resampling.LANCZOS)
                     
                     dib = ImageWin.Dib(img)
@@ -525,6 +561,169 @@ if not os.path.exists(STATIC_FOLDER):
 
 PRINTERS = [p[2] for p in win32print.EnumPrinters(2)]
 
+# --- Windows 打印参数支持的 ctypes 定义 ---
+# pywin32 的 PyCDC 不支持 ResetDC，PyDEVMODE 也不能直接铺给 ctypes，
+# 因此这里用 ctypes 直接定义 DEVMODEW 调用 winspool DocumentPropertiesW
+# 和 gdi32 ResetDCW 来真正下发 duplex 等参数。
+
+class _DEVMODE(ctypes.Structure):
+    _fields_ = [
+        ('dmDeviceName', ctypes.c_wchar * 32),
+        ('dmSpecVersion', wintypes.WORD), ('dmDriverVersion', wintypes.WORD),
+        ('dmSize', wintypes.WORD), ('dmDriverExtra', wintypes.WORD),
+        ('dmFields', wintypes.DWORD),
+        ('dmOrientation', wintypes.SHORT), ('dmPaperSize', wintypes.SHORT),
+        ('dmPaperLength', wintypes.SHORT), ('dmPaperWidth', wintypes.SHORT),
+        ('dmScale', wintypes.SHORT), ('dmCopies', wintypes.SHORT),
+        ('dmDefaultSource', wintypes.SHORT), ('dmPrintQuality', wintypes.SHORT),
+        ('dmColor', wintypes.SHORT), ('dmDuplex', wintypes.SHORT),
+        ('dmYResolution', wintypes.SHORT), ('dmTTOption', wintypes.SHORT),
+        ('dmCollate', wintypes.SHORT),
+        ('dmFormName', ctypes.c_wchar * 32),
+        ('dmLogPixels', wintypes.WORD), ('dmBitsPerPel', wintypes.DWORD),
+        ('dmPelsWidth', wintypes.DWORD), ('dmPelsHeight', wintypes.DWORD),
+        ('dmDisplayFlags', wintypes.DWORD), ('dmDisplayFrequency', wintypes.DWORD),
+        ('dmICMMethod', wintypes.DWORD), ('dmICMIntent', wintypes.DWORD),
+        ('dmMediaType', wintypes.DWORD), ('dmDitherType', wintypes.DWORD),
+        ('dmReserved1', wintypes.DWORD), ('dmReserved2', wintypes.DWORD),
+        ('dmPanningWidth', wintypes.DWORD), ('dmPanningHeight', wintypes.DWORD),
+    ]
+
+_winspool = ctypes.WinDLL('winspool.drv')
+_gdi32 = ctypes.windll.gdi32
+_winspool.DocumentPropertiesW.argtypes = [
+    wintypes.HWND, wintypes.HANDLE, wintypes.LPCWSTR,
+    ctypes.POINTER(_DEVMODE), ctypes.POINTER(_DEVMODE), wintypes.DWORD
+]
+_winspool.DocumentPropertiesW.restype = wintypes.LONG
+_gdi32.ResetDCW.argtypes = [wintypes.HDC, ctypes.POINTER(_DEVMODE)]
+_gdi32.ResetDCW.restype = wintypes.HDC
+
+def get_printer_capabilities(printer_name):
+    """
+    查询打印机是否支持双面打印。
+    使用 win32print.DeviceCapabilities(DC_DUPLEX) 检测硬件能力。
+    返回 dict: {'duplex': bool}
+    """
+    caps = {'duplex': False}
+    try:
+        if not printer_name:
+            return caps
+        # DC_DUPLEX = 7，返回 1 表示支持双面，0 表示不支持
+        # 注意 pywin32 第二参数 port 必须是字符串，None 会报 TypeError
+        result = win32print.DeviceCapabilities(printer_name, '', 7)
+        caps['duplex'] = (result == 1)
+    except Exception as e:
+        # 查询失败按不支持处理，避免让用户误以为可选双面后被忽略
+        print(f"查询打印机能力失败 [{printer_name}]: {e}")
+        caps['duplex'] = False
+    return caps
+
+def _build_duplex_devmode(printer_name, duplex):
+    """
+    通过 winspool DocumentPropertiesW 获取打印机默认 DEVMODE，
+    然后修改 dmDuplex 字段并重置 DM_DUPLEX 标志位。
+    返回带 driver-extra 内存的 ctypes DEVMODE_FULL 对象。
+    【已废弃】仅保留向后兼容；新代码请调用 _build_print_devmode。
+    """
+    return _build_print_devmode(printer_name, duplex=duplex)
+
+def _build_print_devmode(printer_name, duplex=None, orientation=None, scale=None):
+    """
+    统一的 DEVMODE 构造器，支持同时下发多项打印设置。
+    参数（None 表示不改默认值）：
+        duplex:       1=单面, 2=长边翻转(DMDUP_VERTICAL), 3=短边翻转(DMDUP_HORIZONTAL)
+        orientation:  'portrait'|1=纵向, 'landscape'|2=横向
+        scale:        int 10~200 表示缩放百分比（例如 100=原尺寸, 50=缩小一半）
+    返回带 driver-extra 内存的 ctypes DEVMODE_FULL 对象；如无任何修改返回 None。
+    """
+    duplex = int(duplex) if duplex is not None else None
+    orientation_norm = None
+    if orientation is not None:
+        if isinstance(orientation, str):
+            o = orientation.lower().strip()
+            if o in ('portrait', '1', '纵向'):
+                orientation_norm = win32con.DMORIENT_PORTRAIT
+            elif o in ('landscape', '2', '横向'):
+                orientation_norm = win32con.DMORIENT_LANDSCAPE
+            else:
+                raise Exception(f"无效的 orientation 值: {orientation}")
+        else:
+            oi = int(orientation)
+            if oi == win32con.DMORIENT_PORTRAIT:
+                orientation_norm = win32con.DMORIENT_PORTRAIT
+            elif oi == win32con.DMORIENT_LANDSCAPE:
+                orientation_norm = win32con.DMORIENT_LANDSCAPE
+            else:
+                raise Exception(f"无效的 orientation 值: {orientation}")
+    scale_int = None
+    if scale is not None:
+        try:
+            scale_int = int(scale)
+        except (TypeError, ValueError):
+            raise Exception(f"无效的 scale 值: {scale}")
+        if not (10 <= scale_int <= 200):
+            raise Exception(f"scale 超出范围 [10, 200]: {scale_int}")
+
+    # 没有任何修改时直接返回 None（用打印机默认设置）
+    if duplex is None and orientation_norm is None and scale_int is None:
+        return None
+    # 仅修改单面=默认值视为无修改
+    if duplex == 1 and orientation_norm is None and scale_int is None:
+        return None
+
+    duplex_mapping = {
+        2: win32con.DMDUP_VERTICAL,    # 长边翻转
+        3: win32con.DMDUP_HORIZONTAL,  # 短边翻转
+    }
+    if duplex is not None and duplex != 1 and duplex not in duplex_mapping:
+        raise Exception(f"无效的 duplex 值: {duplex}")
+
+    hprinter = None
+    try:
+        hprinter = win32print.OpenPrinter(printer_name)
+        hp_int = int(hprinter)
+        needed = _winspool.DocumentPropertiesW(None, hp_int, printer_name, None, None, 0)
+        if needed <= 0:
+            raise Exception("无法获取打印机 DEVMODE 大小")
+
+        class _DEVMODE_FULL(_DEVMODE):
+            _fields_ = [('_extra', ctypes.c_ubyte * (needed - ctypes.sizeof(_DEVMODE)))]
+
+        dm = _DEVMODE_FULL()
+        # DM_OUT_BUFFER = 2
+        # 返回值：>0 是 info/warning（如某些字段被裁剪但仍可用），<0 才是错误，==0 是完美成功
+        ret = _winspool.DocumentPropertiesW(None, hp_int, printer_name, ctypes.byref(dm), None, 2)
+        if ret < 0:
+            raise Exception(f"DocumentPropertiesW 失败: {ret}")
+
+        if duplex is not None and duplex != 1:
+            dm.dmDuplex = duplex_mapping[duplex]
+            dm.dmFields |= win32con.DM_DUPLEX
+        if orientation_norm is not None:
+            dm.dmOrientation = orientation_norm
+            dm.dmFields |= win32con.DM_ORIENTATION
+        if scale_int is not None:
+            # dmScale 是百分比：100=原大小，50=一半，200=两倍
+            dm.dmScale = scale_int
+            dm.dmFields |= win32con.DM_SCALE
+        return dm
+    finally:
+        if hprinter is not None:
+            try:
+                win32print.ClosePrinter(hprinter)
+            except Exception:
+                pass
+
+def apply_devmode_to_dc(hdc, devmode):
+    """通过 gdi32.ResetDCW 把修改后的 DEVMODE 下发到 win32ui PyCDC。"""
+    if devmode is None:
+        return
+    handle = hdc.GetHandleOutput()
+    res = _gdi32.ResetDCW(handle, ctypes.byref(devmode))
+    if not res:
+        raise Exception("ResetDCW 失败：DEVMODE 应用失败")
+
 ALLOWED_EXT = {
     'pdf', 'jpg', 'jpeg', 'png', 'bmp', 'gif', 'tiff',
     'txt', 'log', 'md',
@@ -534,9 +733,11 @@ ALLOWED_EXT = {
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXT
 
-def log_print(filename, printer, copies, duplex, papersize, quality, status="成功"):
+def log_print(filename, printer, copies, duplex, papersize, quality, status="成功", orientation=None, scale=None):
+    orient_str = orientation if orientation else '-'
+    scale_str = scale if scale else '-'
     with open(LOG_FILE, 'a', encoding='utf-8') as f:
-        f.write(f"{datetime.now()} 打印: {filename} 打印机: {printer} 份数: {copies} 双面: {duplex} 纸张: {papersize} 质量: {quality} 状态: {status}\n")
+        f.write(f"{datetime.now()} 打印: {filename} 打印机: {printer} 份数: {copies} 双面: {duplex} 方向: {orient_str} 缩放: {scale_str}% 纸张: {papersize} 质量: {quality} 状态: {status}\n")
 
 def get_logs():
     if not os.path.exists(LOG_FILE):
@@ -630,6 +831,14 @@ def print_single():
     paper_size = data.get('paper_size', 'A4')
     quality = data.get('quality', 'normal')
     
+    # 前端拦截失败后的后端兑底校验：打印机不支持双面时禁止使用
+    if int(duplex) != 1:
+        caps = get_printer_capabilities(printer)
+        if not caps.get('duplex', False):
+            msg = f"打印机 [{printer}] 不支持双面打印，请选择单面"
+            log_print(filename, printer, copies, duplex, paper_size, quality, msg)
+            return jsonify({'success': False, 'message': msg})
+    
     try:
         name, ext = os.path.splitext(filename)
         pdf_name = f"{name}.pdf"
@@ -664,6 +873,15 @@ def print_all():
     duplex = data.get('duplex', 1)
     paper_size = data.get('paper_size', 'A4')
     quality = data.get('quality', 'normal')
+    orientation = data.get('orientation')
+    scale = data.get('scale')
+    
+    # 后端兑底校验：打印机不支持双面时禁止使用
+    if int(duplex) != 1:
+        caps = get_printer_capabilities(printer)
+        if not caps.get('duplex', False):
+            msg = f"打印机 [{printer}] 不支持双面打印，请选择单面"
+            return jsonify({'success': False, 'message': msg})
     
     if not PYMUPDF_AVAILABLE:
         return jsonify({'success': False, 'message': 'PyMuPDF未安装，无法静默打印'})
@@ -676,11 +894,11 @@ def print_all():
         for file_info in files:
             if file_info['pdf_path'] and os.path.exists(file_info['pdf_path']):
                 try:
-                    silent_print_pdf(file_info['pdf_path'], printer, copies, duplex)
-                    log_print(file_info['name'], printer, copies, duplex, paper_size, quality, "静默批量打印成功")
+                    silent_print_pdf(file_info['pdf_path'], printer, copies, duplex, orientation=orientation, scale=scale)
+                    log_print(file_info['name'], printer, copies, duplex, paper_size, quality, "静默批量打印成功", orientation, scale)
                     printed_count += 1
                 except Exception as e:
-                    log_print(file_info['name'], printer, copies, duplex, paper_size, quality, f"静默批量打印失败: {str(e)}")
+                    log_print(file_info['name'], printer, copies, duplex, paper_size, quality, f"静默批量打印失败: {str(e)}", orientation, scale)
                     failed_count += 1
         
         if printed_count > 0:
@@ -697,6 +915,19 @@ def print_all():
 @app.route('/api/files')
 def get_files_api():
     return jsonify(get_file_info())
+
+@app.route('/api/printer_capabilities')
+def printer_capabilities_api():
+    """返回所有本地打印机的能力信息，供前端根据硬件能力动态禁用不支持的选项。"""
+    caps = {}
+    for p in PRINTERS:
+        caps[p] = get_printer_capabilities(p)
+    return jsonify(caps)
+
+@app.route('/api/printer_capabilities/<path:printer_name>')
+def printer_capabilities_one_api(printer_name):
+    """查询单台打印机的能力（URL 安全地用 path 接收名字中可能存在的特殊字符）。"""
+    return jsonify(get_printer_capabilities(printer_name))
 
 @app.route('/preview/<filename>')
 def preview_file(filename):

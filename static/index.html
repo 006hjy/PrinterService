@@ -252,6 +252,19 @@
                             <option value="2">长边翻转双面</option>
                             <option value="3">短边翻转双面</option>
                         </select>
+                        <div id="duplexHint" class="form-text"></div>
+                    </div>
+                    <div class="col-6">
+                        <label class="form-label">方向</label>
+                        <select id="orientationSelect" class="form-select">
+                            <option value="">跟随原文</option>
+                            <option value="portrait">纵向</option>
+                            <option value="landscape">横向</option>
+                        </select>
+                    </div>
+                    <div class="col-6">
+                        <label class="form-label">缩放 (%)</label>
+                        <input type="number" id="scaleInput" value="100" min="10" max="200" step="1" class="form-control">
                     </div>
                     <div class="col-12">
                         <button id="printAllBtn" class="btn btn-success w-100">静默打印全部PDF文件</button>
@@ -297,6 +310,62 @@ document.addEventListener('DOMContentLoaded', function() {
     const fileList = document.getElementById('fileList');
     const printAllBtn = document.getElementById('printAllBtn');
     const logList = document.getElementById('logList');
+    const printerSelect = document.getElementById('printerSelect');
+    const duplexSelect = document.getElementById('duplexSelect');
+    const duplexHint = document.getElementById('duplexHint');
+
+    // 缓存打印机能力 { printerName: { duplex: bool } }
+    let printerCapsCache = {};
+
+    // 根据当前选中打印机刷新双面选项可用性
+    function refreshDuplexOptions() {
+        const printer = printerSelect.value;
+        const caps = printerCapsCache[printer] || { duplex: false };
+        // 包裹所有 option 状态：单面总是可用，双面依赖能力
+        Array.from(duplexSelect.options).forEach(opt => {
+            const v = parseInt(opt.value);
+            const supported = (v === 1) || caps.duplex;
+            opt.disabled = !supported;
+            opt.style.color = supported ? '' : '#adb5bd';
+        });
+        // 当前选中的项若被禁用，自动回落到「单面」
+        if (duplexSelect.selectedOptions[0] && duplexSelect.selectedOptions[0].disabled) {
+            duplexSelect.value = '1';
+        }
+        // 提示文案
+        if (!caps.duplex) {
+            duplexHint.textContent = '⚠️ 当前打印机不支持双面打印';
+            duplexHint.style.color = '#dc3545';
+        } else {
+            duplexHint.textContent = '✓ 支持双面打印';
+            duplexHint.style.color = '#198754';
+        }
+    }
+
+    // 拉取本机所有打印机能力
+    function loadPrinterCaps() {
+        fetch('/api/printer_capabilities')
+            .then(r => r.json())
+            .then(caps => {
+                printerCapsCache = caps || {};
+                refreshDuplexOptions();
+            })
+            .catch(err => {
+                console.warn('获取打印机能力失败:', err);
+                refreshDuplexOptions();
+            });
+    }
+
+    printerSelect.addEventListener('change', refreshDuplexOptions);
+    duplexSelect.addEventListener('change', () => {
+        const opt = duplexSelect.selectedOptions[0];
+        if (opt && opt.disabled) {
+            alert('当前打印机不支持此双面模式，已自动切换为单面');
+            duplexSelect.value = '1';
+            refreshDuplexOptions();
+        }
+    });
+    loadPrinterCaps();
     
     dropZone.addEventListener('click', () => fileInput.click());
     
@@ -418,6 +487,21 @@ document.addEventListener('DOMContentLoaded', function() {
         const copies = document.getElementById('copiesInput').value;
         const duplex = document.getElementById('duplexSelect').value;
         const paperSize = document.getElementById('paperSizeInput').value;
+        const orientation = document.getElementById('orientationSelect').value || null;
+        const scaleRaw = document.getElementById('scaleInput').value;
+        const scale = (scaleRaw && parseInt(scaleRaw) !== 100) ? parseInt(scaleRaw) : null;
+
+        // 前端拦截：禁止提交被禁用的双面模式
+        const curOpt = duplexSelect.selectedOptions[0];
+        if (curOpt && curOpt.disabled) {
+            addLogEntry(`✗ 打印失败: ${filename} - 当前打印机不支持选中的双面模式`);
+            return;
+        }
+        // 前端拦截：缩放范围校验
+        if (scale !== null && (scale < 10 || scale > 200)) {
+            addLogEntry(`✗ 打印失败: ${filename} - 缩放必须在 10% ~ 200% 之间`);
+            return;
+        }
         
         fetch('/print_single', {
             method: 'POST',
@@ -428,7 +512,9 @@ document.addEventListener('DOMContentLoaded', function() {
                 copies: parseInt(copies),
                 duplex: parseInt(duplex),
                 paper_size: paperSize,
-                quality: 'normal'
+                quality: 'normal',
+                orientation: orientation,
+                scale: scale
             })
         })
         .then(response => response.json())
@@ -450,6 +536,15 @@ document.addEventListener('DOMContentLoaded', function() {
         const copies = document.getElementById('copiesInput').value;
         const duplex = document.getElementById('duplexSelect').value;
         const paperSize = document.getElementById('paperSizeInput').value;
+        const orientation = document.getElementById('orientationSelect').value || null;
+        const scaleRaw = document.getElementById('scaleInput').value;
+        const scale = (scaleRaw && parseInt(scaleRaw) !== 100) ? parseInt(scaleRaw) : null;
+
+        // 前端拦截：缩放范围校验
+        if (scale !== null && (scale < 10 || scale > 200)) {
+            addLogEntry('✗ 静默批量打印失败: 缩放必须在 10% ~ 200% 之间');
+            return;
+        }
         
         fetch('/print_all', {
             method: 'POST',
@@ -459,7 +554,9 @@ document.addEventListener('DOMContentLoaded', function() {
                 copies: parseInt(copies),
                 duplex: parseInt(duplex),
                 paper_size: paperSize,
-                quality: 'normal'
+                quality: 'normal',
+                orientation: orientation,
+                scale: scale
             })
         })
         .then(response => response.json())
