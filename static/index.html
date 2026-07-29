@@ -248,6 +248,25 @@
                         </select>
                         <div id="duplexHint" class="form-text"></div>
                     </div>
+                    <div class="col-12">
+                        <label class="form-label">打印页数</label>
+                        <div class="row g-2 align-items-center">
+                            <div class="col-5">
+                                <select id="pageModeSelect" class="form-select">
+                                    <option value="all">全部</option>
+                                    <option value="odd">仅奇数页</option>
+                                    <option value="even">仅偶数页</option>
+                                    <option value="custom">自定义</option>
+                                </select>
+                            </div>
+                            <div class="col-7">
+                                <input type="text" id="pageRangeInput" class="form-control"
+                                    placeholder="如：1-3,5,8-10" disabled
+                                    title="仅在选择「自定义」时启用。支持范围 a-b 和单个页码，逗号分隔，页号从 1 开始。">
+                            </div>
+                        </div>
+                        <div id="pageHint" class="form-text"></div>
+                    </div>
                     <div class="col-6">
                         <label class="form-label">方向</label>
                         <select id="orientationSelect" class="form-select">
@@ -649,6 +668,8 @@ document.addEventListener('DOMContentLoaded', function() {
         const orientation = document.getElementById('orientationSelect').value || null;
         const scaleRaw = document.getElementById('scaleInput').value;
         const scale = (scaleRaw && parseInt(scaleRaw) !== 100) ? parseInt(scaleRaw) : null;
+        const pageMode = document.getElementById('pageModeSelect').value;
+        const pageRange = document.getElementById('pageRangeInput').value.trim();
 
         // 前端拦截：禁止提交被禁用的双面模式
         const curOpt = duplexSelect.selectedOptions[0];
@@ -659,6 +680,12 @@ document.addEventListener('DOMContentLoaded', function() {
         // 前端拦截：缩放范围校验
         if (scale !== null && (scale < 10 || scale > 200)) {
             addLogEntry(`✗ 打印失败: ${filename} - 缩放必须在 10% ~ 200% 之间`);
+            return;
+        }
+        // 前端拦截：自定义页码范围校验
+        const rangeErr = validatePageRange(pageMode, pageRange);
+        if (rangeErr) {
+            addLogEntry(`✗ 打印失败: ${filename} - ${rangeErr}`);
             return;
         }
         
@@ -673,7 +700,9 @@ document.addEventListener('DOMContentLoaded', function() {
                 paper_size: paperSize,
                 quality: 'normal',
                 orientation: orientation,
-                scale: scale
+                scale: scale,
+                page_mode: pageMode,
+                page_range: (pageMode === 'custom') ? pageRange : null
             })
         })
         .then(response => response.json())
@@ -698,10 +727,18 @@ document.addEventListener('DOMContentLoaded', function() {
         const orientation = document.getElementById('orientationSelect').value || null;
         const scaleRaw = document.getElementById('scaleInput').value;
         const scale = (scaleRaw && parseInt(scaleRaw) !== 100) ? parseInt(scaleRaw) : null;
+        const pageMode = document.getElementById('pageModeSelect').value;
+        const pageRange = document.getElementById('pageRangeInput').value.trim();
 
         // 前端拦截：缩放范围校验
         if (scale !== null && (scale < 10 || scale > 200)) {
             addLogEntry('✗ 静默批量打印失败: 缩放必须在 10% ~ 200% 之间');
+            return;
+        }
+        // 前端拦截：自定义页码范围校验
+        const rangeErr = validatePageRange(pageMode, pageRange);
+        if (rangeErr) {
+            addLogEntry(`✗ 静默批量打印失败: ${rangeErr}`);
             return;
         }
         
@@ -715,7 +752,9 @@ document.addEventListener('DOMContentLoaded', function() {
                 paper_size: paperSize,
                 quality: 'normal',
                 orientation: orientation,
-                scale: scale
+                scale: scale,
+                page_mode: pageMode,
+                page_range: (pageMode === 'custom') ? pageRange : null
             })
         })
         .then(response => response.json())
@@ -741,6 +780,45 @@ document.addEventListener('DOMContentLoaded', function() {
         if (logList.children.length > 10) {
             logList.removeChild(logList.lastChild);
         }
+    }
+
+    // ===== 打印页数选择 =====
+    const pageModeSelect = document.getElementById('pageModeSelect');
+    const pageRangeInput = document.getElementById('pageRangeInput');
+    const pageHint = document.getElementById('pageHint');
+
+    function updatePageRangeUI() {
+        if (pageModeSelect.value === 'custom') {
+            pageRangeInput.disabled = false;
+            pageRangeInput.focus();
+            pageHint.textContent = '示例：1-3,5,8-10（页号从 1 开始）';
+        } else {
+            pageRangeInput.disabled = true;
+            pageHint.textContent = '';
+        }
+    }
+    pageModeSelect.addEventListener('change', updatePageRangeUI);
+
+    function validatePageRange(mode, range) {
+        // 返回错误描述字符串；合法时返回 null
+        if (mode !== 'custom') return null;
+        if (!range) return '自定义页码不能为空';
+        const parts = range.split(',');
+        for (let part of parts) {
+            part = part.trim();
+            if (!part) continue;
+            if (part.includes('-')) {
+                const segs = part.split('-');
+                if (segs.length !== 2) return `范围格式错误: ${part}`;
+                const lo = parseInt(segs[0], 10);
+                const hi = parseInt(segs[1], 10);
+                if (isNaN(lo) || isNaN(hi) || lo < 1 || hi < 1) return `页码必须为正整数: ${part}`;
+            } else {
+                const p = parseInt(part, 10);
+                if (isNaN(p) || p < 1) return `页码必须为正整数: ${part}`;
+            }
+        }
+        return null;
     }
 	
 	window.showDeleteModal = function(filename) {

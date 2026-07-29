@@ -98,7 +98,79 @@ def create_simple_printer_icon():
     
     return image
 
-def silent_print_pdf(pdf_path, printer_name, copies=1, duplex=1, orientation=None, scale=None, paper_size=None):
+def parse_page_selection(mode, custom_range, total_pages):
+    """
+    根据模式返回需打印的 0 基页码列表。
+    mode: 'all' | 'odd' | 'even' | 'custom'
+    custom_range: 当 mode == 'custom' 时使用，如 '1-3,5,7-9'（用户输入为 1 基）
+    """
+    if total_pages <= 0:
+        return []
+    mode = (mode or 'all').lower()
+    if mode == 'odd':
+        # 1 基奇数页 1,3,5... -> 0 基 0,2,4...
+        return list(range(0, total_pages, 2))
+    if mode == 'even':
+        # 1 基偶数页 2,4,6... -> 0 基 1,3,5...
+        return list(range(1, total_pages, 2))
+    if mode == 'custom':
+        if not custom_range:
+            return list(range(total_pages))
+        # 严格模式：规范输入后再校验每段都在 [1, total_pages] 内，
+        # 一旦发现任何越界页号就抛错，要求用户修正（不静默裁剪）。
+        # 先收集 (lo, hi) 段，便于拼出精准的错误信息（"5-10" 而不是 "5,6,7,..."）。
+        segments = []  # 每个 item: (lo, hi) 已 swap，1 基闭区间
+        for part in str(custom_range).split(','):
+            part = part.strip()
+            if not part:
+                continue
+            if '-' in part:
+                lo_s, hi_s = part.split('-', 1)
+                try:
+                    lo = int(lo_s.strip()); hi = int(hi_s.strip())
+                except ValueError:
+                    raise Exception(f"无法解析页码范围: {part}")
+                if lo < 1 or hi < 1:
+                    raise Exception(f"页码必须为正整数: {part}")
+                if lo > hi:
+                    lo, hi = hi, lo
+                segments.append((lo, hi))
+            else:
+                try:
+                    p = int(part)
+                except ValueError:
+                    raise Exception(f"无法解析页码: {part}")
+                if p < 1:
+                    raise Exception(f"页码必须为正整数: {part}")
+                segments.append((p, p))
+        # 全部解析成功后再统一校验越界（保证先发现格式错误再发现越界）
+        for lo, hi in segments:
+            if lo > total_pages or hi > total_pages:
+                bad = f"{lo}-{hi}" if lo != hi else str(lo)
+                raise Exception(
+                    f"页码 {bad} 超出文件实际页数范围（共 {total_pages} 页）"
+                )
+        pages = set()
+        for lo, hi in segments:
+            for p in range(lo, hi + 1):
+                pages.add(p - 1)
+        return sorted(pages)
+    return list(range(total_pages))
+
+
+def page_selection_label(mode, custom_range):
+    """返回日志/提示用的中文标签"""
+    mode = (mode or 'all').lower()
+    if mode == 'odd':
+        return '仅奇数页'
+    if mode == 'even':
+        return '仅偶数页'
+    if mode == 'custom':
+        return f'自定义页({custom_range or "全部"})'
+    return '全部页'
+
+
+def silent_print_pdf(pdf_path, printer_name, copies=1, duplex=1, orientation=None, scale=None, paper_size=None, page_mode='all', page_range=None):
     if not PYMUPDF_AVAILABLE:
         raise Exception("PyMuPDF未安装，无法使用静默打印")
     
@@ -131,6 +203,11 @@ def silent_print_pdf(pdf_path, printer_name, copies=1, duplex=1, orientation=Non
         pdf_doc = fitz.open(pdf_path)
         hprinter = win32print.OpenPrinter(printer_name)
         
+        # 计算实际需要打印的页码（全部/奇数/偶数/自定义）
+        page_indices = parse_page_selection(page_mode, page_range, len(pdf_doc))
+        if not page_indices:
+            raise Exception("没有满足条件的页面可打印，请检查自定义页码范围")
+        
         try:
             printer_info = win32print.GetPrinter(hprinter, 2)
             hdc = win32ui.CreateDC()
@@ -150,7 +227,7 @@ def silent_print_pdf(pdf_path, printer_name, copies=1, duplex=1, orientation=Non
             for copy_num in range(copies):
                 hdc.StartDoc("PDF Silent Print")
                 
-                for page_num in range(len(pdf_doc)):
+                for page_num in page_indices:
                     hdc.StartPage()
                     
                     page = pdf_doc[page_num]
@@ -911,11 +988,12 @@ ALLOWED_EXT = {
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXT
 
-def log_print(filename, printer, copies, duplex, papersize, quality, status="成功", orientation=None, scale=None):
+def log_print(filename, printer, copies, duplex, papersize, quality, status="成功", orientation=None, scale=None, page_mode=None, page_range=None):
     orient_str = orientation if orientation else '-'
     scale_str = scale if scale else '-'
+    page_str = page_selection_label(page_mode, page_range)
     with open(LOG_FILE, 'a', encoding='utf-8') as f:
-        f.write(f"{datetime.now()} 打印: {filename} 打印机: {printer} 份数: {copies} 双面: {duplex} 方向: {orient_str} 缩放: {scale_str}% 纸张: {papersize} 质量: {quality} 状态: {status}\n")
+        f.write(f"{datetime.now()} 打印: {filename} 打印机: {printer} 份数: {copies} 双面: {duplex} 页数: {page_str} 方向: {orient_str} 缩放: {scale_str}% 纸张: {papersize} 质量: {quality} 状态: {status}\n")
 
 def get_logs():
     if not os.path.exists(LOG_FILE):
@@ -1042,13 +1120,15 @@ def print_single():
         paper_size = None
     paper_size_log = paper_size if paper_size else '默认'
     quality = data.get('quality', 'normal')
+    page_mode = data.get('page_mode', 'all')
+    page_range = data.get('page_range')
     
     # 前端拦截失败后的后端兑底校验：打印机不支持双面时禁止使用
     if int(duplex) != 1:
         caps = get_printer_capabilities(printer)
         if not caps.get('duplex', False):
             msg = f"打印机 [{printer}] 不支持双面打印，请选择单面"
-            log_print(filename, printer, copies, duplex, paper_size_log, quality, msg)
+            log_print(filename, printer, copies, duplex, paper_size_log, quality, msg, page_mode=page_mode, page_range=page_range)
             return jsonify({'success': False, 'message': msg})
     
     try:
@@ -1060,8 +1140,8 @@ def print_single():
             return jsonify({'success': False, 'message': '文件未转换为PDF，无法静默打印'})
         
         try:
-            silent_print_pdf(pdf_path, printer, copies, duplex, paper_size=paper_size)
-            log_print(filename, printer, copies, duplex, paper_size_log, quality, "静默打印成功")
+            silent_print_pdf(pdf_path, printer, copies, duplex, paper_size=paper_size, page_mode=page_mode, page_range=page_range)
+            log_print(filename, printer, copies, duplex, paper_size_log, quality, "静默打印成功", page_mode=page_mode, page_range=page_range)
             return jsonify({'success': True, 'message': '静默打印成功'})
         except Exception as e:
             if PYMUPDF_AVAILABLE:
@@ -1069,12 +1149,12 @@ def print_single():
             else:
                 error_msg = "PyMuPDF未安装，无法静默打印"
             
-            log_print(filename, printer, copies, duplex, paper_size, quality, error_msg)
+            log_print(filename, printer, copies, duplex, paper_size, quality, error_msg, page_mode=page_mode, page_range=page_range)
             return jsonify({'success': False, 'message': error_msg})
             
     except Exception as e:
         error_msg = f"打印失败: {str(e)}"
-        log_print(filename, printer, copies, duplex, paper_size, quality, error_msg)
+        log_print(filename, printer, copies, duplex, paper_size, quality, error_msg, page_mode=page_mode, page_range=page_range)
         return jsonify({'success': False, 'message': error_msg})
 
 @app.route('/print_all', methods=['POST'])
@@ -1093,6 +1173,8 @@ def print_all():
     quality = data.get('quality', 'normal')
     orientation = data.get('orientation')
     scale = data.get('scale')
+    page_mode = data.get('page_mode', 'all')
+    page_range = data.get('page_range')
     
     # 后端兑底校验：打印机不支持双面时禁止使用
     if int(duplex) != 1:
@@ -1112,11 +1194,11 @@ def print_all():
         for file_info in files:
             if file_info['pdf_path'] and os.path.exists(file_info['pdf_path']):
                 try:
-                    silent_print_pdf(file_info['pdf_path'], printer, copies, duplex, orientation=orientation, scale=scale, paper_size=paper_size)
-                    log_print(file_info['name'], printer, copies, duplex, paper_size_log, quality, "静默批量打印成功", orientation, scale)
+                    silent_print_pdf(file_info['pdf_path'], printer, copies, duplex, orientation=orientation, scale=scale, paper_size=paper_size, page_mode=page_mode, page_range=page_range)
+                    log_print(file_info['name'], printer, copies, duplex, paper_size_log, quality, "静默批量打印成功", orientation, scale, page_mode=page_mode, page_range=page_range)
                     printed_count += 1
                 except Exception as e:
-                    log_print(file_info['name'], printer, copies, duplex, paper_size_log, quality, f"静默批量打印失败: {str(e)}", orientation, scale)
+                    log_print(file_info['name'], printer, copies, duplex, paper_size_log, quality, f"静默批量打印失败: {str(e)}", orientation, scale, page_mode=page_mode, page_range=page_range)
                     failed_count += 1
         
         if printed_count > 0:
