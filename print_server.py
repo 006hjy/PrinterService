@@ -231,7 +231,9 @@ def silent_print_pdf(pdf_path, printer_name, copies=1, duplex=1, orientation=Non
                     hdc.StartPage()
                     
                     page = pdf_doc[page_num]
-                    mat = fitz.Matrix(2.0, 2.0)
+                    # 渲染到 3000 DPI（PDF 默认 72 DPI，缩放系数 = 3000/72 ≈ 41.67）
+                    render_scale = 1296.0 / 72.0
+                    mat = fitz.Matrix(render_scale, render_scale)
                     pix = page.get_pixmap(matrix=mat)
                     
                     img_data = pix.tobytes("ppm")
